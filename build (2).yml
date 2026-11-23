@@ -1,0 +1,363 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoLauncher"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=false
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.autolauncher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.autolauncher"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application android:label="AutoLauncher" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".AutomationService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="service_desc">Выполняет выбранные сценарии автоматизации в приложениях</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/autolauncher
+          cat > app/src/main/java/com/autolauncher/Scenario.kt <<'EOF_FILE'
+          package com.autolauncher
+
+          /** Шаги сценария. Координаты тапов — доли экрана (0.0..1.0), т.к. игры на Unity не отдают элементы UI. */
+          sealed class Step {
+              data class Wait(val ms: Long) : Step()
+              data class Tap(val x: Float, val y: Float, val note: String = "") : Step()
+              data class Chat(val text: String) : Step()   // тап по полю чата + ввод + отправка
+              data class Type(val text: String) : Step()   // ввод в поле, которое уже в фокусе
+          }
+
+          class Scenario(val id: String, val title: String, val packages: List<String>, val steps: List<Step>)
+
+          object Scenarios {
+              const val TRANSFER_ACCOUNT = "366263"
+              const val PROMO = "alenka"
+
+              // Координаты ниже — заготовки. Откалибруй под свой экран (см. README).
+              private val CHAT_BTN = 0.05f to 0.10f
+              private val CHAT_SEND = 0.95f to 0.90f
+
+              private fun tutorial(): List<Step> {
+                  val out = ArrayList<Step>()
+                  repeat(25) {
+                      out.add(Step.Tap(0.50f, 0.88f, "Далее"))
+                      out.add(Step.Wait(2500))
+                  }
+                  return out
+              }
+
+              private fun part1(): List<Step> = listOf(
+                      Step.Wait(30_000),                                   // загрузка игры
+                      // 1. Новый аккаунт
+                      Step.Tap(0.50f, 0.80f, "Новый аккаунт / Регистрация"),
+                      Step.Wait(2000),
+                      Step.Tap(0.50f, 0.45f, "Поле ника"),
+                      Step.Type("Alex_Smirnov"),
+                      Step.Tap(0.50f, 0.85f, "Продолжить"),
+                      Step.Wait(5000)
+                  )
+
+              private fun part2(): List<Step> = listOf(
+                      // 3. Промокод
+                      Step.Tap(0.50f, 0.50f, "Кнопка /promo (если есть в меню)"),
+                      Step.Chat("/promo"),
+                      Step.Wait(1500),
+                      Step.Type(PROMO),
+                      Step.Tap(0.50f, 0.60f, "Подтвердить промокод"),
+                      Step.Wait(2000),
+                      // 4. Награды
+                      Step.Chat("/reward"),
+                      Step.Wait(2000),
+                      Step.Tap(0.30f, 0.50f, "Забрать приз 1"),
+                      Step.Tap(0.50f, 0.50f, "Забрать приз 2"),
+                      Step.Tap(0.70f, 0.50f, "Забрать приз 3 (купон x2 НЕ брать)"),
+                      Step.Tap(0.95f, 0.08f, "Закрыть"),
+                      // 5. Квесты
+                      Step.Chat("/quest"),
+                      Step.Wait(2000),
+                      Step.Tap(0.50f, 0.70f, "Покупка скина"),
+                      Step.Wait(1500),
+                      Step.Tap(0.50f, 0.80f, "Купить / надеть"),
+                      Step.Tap(0.50f, 0.50f, "Задание «Банковские услуги»"),
+                      Step.Tap(0.50f, 0.85f, "Взять задание"),
+                      // 6. Банкомат
+                      Step.Chat("/gps"),
+                      Step.Wait(1500),
+                      Step.Tap(0.50f, 0.40f, "Пункт «Банкомат»"),
+                      Step.Wait(40_000),                                   // дойти до банкомата
+                      Step.Tap(0.50f, 0.50f, "Открыть банкомат"),
+                      Step.Tap(0.50f, 0.60f, "Положить всё на счёт"),
+                      Step.Tap(0.50f, 0.70f, "Перевод"),
+                      Step.Tap(0.50f, 0.40f, "Поле номера счёта"),
+                      Step.Type(TRANSFER_ACCOUNT),
+                      Step.Tap(0.50f, 0.85f, "Подтвердить перевод")
+                  )
+
+              val blackRussia = Scenario(
+                  id = "black_russia",
+                  title = "Black Russia",
+                  packages = listOf("com.br.top", "com.blackrussia.game"), // проверь имя пакета на телефоне
+                  steps = part1() + tutorial() + part2()
+              )
+
+              val all = listOf(blackRussia)
+              fun byId(id: String) = all.firstOrNull { it.id == id }
+              fun forPackage(pkg: String) = all.firstOrNull { pkg in it.packages }
+
+              fun chatButton() = CHAT_BTN
+              fun chatSend() = CHAT_SEND
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/autolauncher
+          cat > app/src/main/java/com/autolauncher/AutomationService.kt <<'EOF_FILE'
+          package com.autolauncher
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.os.Bundle
+          import android.util.DisplayMetrics
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+
+          class AutomationService : AccessibilityService() {
+
+              companion object {
+                  @Volatile var instance: AutomationService? = null
+                  @Volatile private var worker: Thread? = null
+
+                  fun run(s: Scenario) {
+                      val svc = instance ?: return
+                      stop()
+                      worker = Thread { svc.execute(s) }.also { it.start() }
+                  }
+                  fun stop() { worker?.interrupt(); worker = null }
+              }
+
+              override fun onServiceConnected() { instance = this }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() { stop() }
+              override fun onDestroy() { stop(); instance = null; super.onDestroy() }
+
+              private fun execute(s: Scenario) {
+                  try {
+                      for (step in s.steps) {
+                          when (step) {
+                              is Step.Wait -> Thread.sleep(step.ms)
+                              is Step.Tap -> { tap(step.x, step.y); Thread.sleep(700) }
+                              is Step.Type -> { typeText(step.text); Thread.sleep(500) }
+                              is Step.Chat -> {
+                                  val (cx, cy) = Scenarios.chatButton(); tap(cx, cy); Thread.sleep(800)
+                                  typeText(step.text); Thread.sleep(400)
+                                  val (sx, sy) = Scenarios.chatSend(); tap(sx, sy); Thread.sleep(1200)
+                              }
+                          }
+                      }
+                  } catch (e: InterruptedException) { }
+              }
+
+              private fun tap(fx: Float, fy: Float) {
+                  val m: DisplayMetrics = resources.displayMetrics
+                  val p = Path().apply { moveTo(fx * m.widthPixels, fy * m.heightPixels) }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(p, 0, 80)).build()
+                  val latch = CountDownLatch(1)
+                  dispatchGesture(g, object : GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) { latch.countDown() }
+                      override fun onCancelled(d: GestureDescription?) { latch.countDown() }
+                  }, null)
+                  latch.await(2, TimeUnit.SECONDS)
+              }
+
+              private fun typeText(text: String) {
+                  val node: AccessibilityNodeInfo? = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                  node?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  })
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/autolauncher
+          cat > app/src/main/java/com/autolauncher/MainActivity.kt <<'EOF_FILE'
+          package com.autolauncher
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val dp = resources.displayMetrics.density
+                  fun px(v: Int) = (v * dp).toInt()
+
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(px(16), px(16), px(16), px(16)) }
+
+                  val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  val settings = Button(this).apply {
+                      text = "Настройки"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Стоп"
+                      setOnClickListener { AutomationService.stop(); toast("Остановлено") }
+                  }
+                  top.addView(settings, LinearLayout.LayoutParams(0, -2, 1f))
+                  top.addView(stop, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(top)
+
+                  root.addView(TextView(this).apply {
+                      text = "Включи «AutoLauncher» в Специальных возможностях (кнопка Настройки), затем выбери автоматизацию и жми «Запустить»."
+                      setPadding(0, px(8), 0, px(8))
+                  })
+
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val pm = packageManager
+                  val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(launcherIntent, 0)
+                      .filter { it.activityInfo.packageName != packageName }
+                      .sortedBy { it.loadLabel(pm).toString().lowercase() }
+
+                  for (ri in apps) {
+                      val pkg = ri.activityInfo.packageName
+                      val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, px(8), 0, px(8)) }
+                      row.addView(TextView(this).apply { text = ri.loadLabel(pm); textSize = 17f })
+
+                      val options = listOf("Без автоматизации") + Scenarios.all.map { it.title }
+                      val spinner = Spinner(this).apply {
+                          adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, options)
+                          val saved = Scenarios.byId(prefs.getString("auto_$pkg", "") ?: "")
+                          setSelection(if (saved == null) 0 else options.indexOf(saved.title))
+                          onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                              override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                                  prefs.edit().putString("auto_$pkg", if (pos == 0) "" else Scenarios.all[pos - 1].id).apply()
+                              }
+                              override fun onNothingSelected(p: AdapterView<*>?) {}
+                          }
+                      }
+                      row.addView(spinner)
+
+                      row.addView(Button(this).apply {
+                          text = "Запустить"
+                          setOnClickListener {
+                              val sc = Scenarios.byId(prefs.getString("auto_$pkg", "") ?: "")
+                              val launch = pm.getLaunchIntentForPackage(pkg)
+                              if (launch == null) { toast("Не удалось открыть"); return@setOnClickListener }
+                              startActivity(launch)
+                              if (sc != null) {
+                                  if (AutomationService.instance == null) toast("Включи сервис в Настройках")
+                                  else AutomationService.run(sc)
+                              }
+                          }
+                      })
+                      list.addView(row)
+                  }
+
+                  root.addView(ScrollView(this).apply { addView(list) })
+                  setContentView(root)
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF_FILE
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoLauncher-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
